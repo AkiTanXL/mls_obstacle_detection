@@ -1,0 +1,11 @@
+name: mls-obstacle-detection
+channels:
+  - conda-forge
+dependencies:
+  - cmake>=3.20
+  - cxx-compiler
+  - pcl=1.15.1
+  - cli11
+  - yaml-cpp
+  - nlohmann_json
+  - gtest

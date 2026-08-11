@@ -1,0 +1,18 @@
+/build*/
+/CMakeFiles/
+/.cmake/
+/.cache/
+compile_commands.json
+
+# Local IDE and operating-system files
+.vscode/
+.idea/
+.DS_Store
+AGENTS.md
+
+# Local environment overrides and generated results
+.env
+.env.*
+!.env.example
+/output/
+/results/

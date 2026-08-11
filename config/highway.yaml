@@ -1,0 +1,32 @@
+roi:
+  min: [-10.0, -8.0, -3.0]
+  max: [50.0, 8.0, 3.0]
+ego_box:
+  min: [-1.5, -1.7, -1.0]
+  max: [2.6, 1.7, -0.4]
+voxel:
+  leaf_size: 0.2
+  min_points_per_voxel: 1
+ground:
+  model: perpendicular_plane
+  axis: [0.0, 0.0, 1.0]
+  max_angle_deg: 15.0
+  distance_threshold: 0.2
+  max_iterations: 100
+  probability: 0.99
+  optimize_coefficients: true
+  min_inlier_ratio: 0.15
+cluster:
+  tolerance: 0.35
+  min_points: 10
+  max_points: 1000
+color:
+  palette: red_green
+  min_distance: 0.0
+  max_distance: 50.0
+  clamp: true
+save:
+  binary_compressed: true
+playback:
+  fps: 60.0
+  loop: true
