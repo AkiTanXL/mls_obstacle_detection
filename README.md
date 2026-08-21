@@ -4,7 +4,7 @@ A compact C++17/PCL demo for obstacle detection in vehicle LiDAR point clouds. T
 
 ## Demo
 
-![Vehicle LiDAR obstacle detection](docs/demo.gif)
+![Vehicle LiDAR obstacle detection at 2x playback speed](docs/demo.gif)
 
 ## Features
 
