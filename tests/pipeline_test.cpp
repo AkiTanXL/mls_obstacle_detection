@@ -44,6 +44,29 @@ od::Frame scene() {
   return frame;
 }
 
+od::Frame elongatedInteriorScene() {
+  od::Frame frame;
+  frame.id = "elongated_interior";
+  for (int x = 0; x <= 30; ++x) {
+    for (int y = -4; y <= 4; ++y) {
+      pcl::PointXYZI point;
+      point.x = static_cast<float>(x);
+      point.y = static_cast<float>(y);
+      point.z = 0.F;
+      frame.cloud->push_back(point);
+    }
+  }
+  for (int step = 0; step <= 96; ++step) {
+    const float distance = 0.25F * static_cast<float>(step);
+    pcl::PointXYZI point;
+    point.x = 5.F + distance;
+    point.y = 6.F;
+    point.z = 1.F;
+    frame.cloud->push_back(point);
+  }
+  return frame;
+}
+
 }  // namespace
 
 TEST(Pipeline, SegmentsTiltedGroundClustersAndLabelsOriginalResolution) {
@@ -86,6 +109,75 @@ TEST(Pipeline, VoxelManyToOneWritesBackEveryRawPoint) {
   for (std::size_t i = frame.cloud->size() - 4; i < frame.cloud->size(); ++i) {
     EXPECT_EQ(result.labeled_cloud->points[i].instance_id, 1U);
   }
+}
+
+TEST(Pipeline, FiltersEveryClusterAtHorizontalBoundaryAndRenumbersObstacles) {
+  auto config = testConfig();
+  config.roi.box.max[1] = 2.5F;
+  config.cluster_filter.roi_boundary_margin = 0.5F;
+  const auto result = od::ObstacleDetectionPipeline(config).process(scene());
+
+  ASSERT_EQ(result.obstacles.size(), 1U);
+  EXPECT_FLOAT_EQ(result.obstacles[0].aabb.min[0], 8.F);
+  EXPECT_EQ(result.obstacles[0].instance_id, 1U);
+  ASSERT_EQ(result.filtered_clusters.size(), 1U);
+  const auto& filtered = result.filtered_clusters[0];
+  EXPECT_EQ(filtered.point_count, 3U);
+  EXPECT_EQ(filtered.boundary_faces, (std::vector<std::string>{"y_max"}));
+  EXPECT_EQ(result.counts.filtered_cluster_points, 3U);
+  for (std::size_t index = 42; index < 45; ++index) {
+    EXPECT_EQ(result.labeled_cloud->points[index].semantic_label,
+              static_cast<std::uint32_t>(od::SemanticLabel::non_ground_unclustered));
+    EXPECT_EQ(result.labeled_cloud->points[index].instance_id, 0U);
+    EXPECT_EQ(result.labeled_cloud->points[index].rgba, od::packRgba(config.color.unclustered));
+  }
+}
+
+TEST(Pipeline, KeepsClusterOutsideBoundaryMarginAndWhenFilterDisabled) {
+  auto config = testConfig();
+  config.roi.box.max[1] = 2.51F;
+  config.cluster_filter.roi_boundary_margin = 0.5F;
+  auto result = od::ObstacleDetectionPipeline(config).process(scene());
+  EXPECT_EQ(result.obstacles.size(), 2U);
+  EXPECT_TRUE(result.filtered_clusters.empty());
+
+  config.roi.box.max[1] = 2.1F;
+  config.cluster_filter.enabled = false;
+  result = od::ObstacleDetectionPipeline(config).process(scene());
+  EXPECT_EQ(result.obstacles.size(), 2U);
+  EXPECT_TRUE(result.filtered_clusters.empty());
+}
+
+TEST(Pipeline, RecordsEveryTouchedHorizontalFaceAndIgnoresVerticalBoundary) {
+  auto corner_config = testConfig();
+  corner_config.roi.box.max[0] = 3.5F;
+  corner_config.roi.box.max[1] = 2.5F;
+  corner_config.cluster_filter.roi_boundary_margin = 0.5F;
+  auto result = od::ObstacleDetectionPipeline(corner_config).process(scene());
+  ASSERT_EQ(result.filtered_clusters.size(), 1U);
+  EXPECT_EQ(result.filtered_clusters[0].boundary_faces,
+            (std::vector<std::string>{"x_max", "y_max"}));
+
+  auto vertical_config = testConfig();
+  vertical_config.roi.box.max[2] = 1.2F;
+  result = od::ObstacleDetectionPipeline(vertical_config).process(scene());
+  EXPECT_EQ(result.obstacles.size(), 2U);
+  EXPECT_TRUE(result.filtered_clusters.empty());
+}
+
+TEST(Pipeline, KeepsLargeInteriorClusterWithoutGeometryThresholds) {
+  auto config = testConfig();
+  config.roi.box = {{-5.F, -10.F, -2.F}, {35.F, 10.F, 1.1F}};
+  config.ego.box = {{-5.F, -10.F, -2.F}, {-4.F, -9.F, -1.F}};
+  config.voxel.leaf_size = 0.05F;
+  config.cluster.tolerance = 0.3F;
+  config.cluster.max_points = 150;
+  const auto result = od::ObstacleDetectionPipeline(config).process(elongatedInteriorScene());
+
+  ASSERT_EQ(result.obstacles.size(), 1U);
+  EXPECT_EQ(result.obstacles[0].point_count, 97U);
+  EXPECT_FLOAT_EQ(result.obstacles[0].aabb.max[0] - result.obstacles[0].aabb.min[0], 24.F);
+  EXPECT_TRUE(result.filtered_clusters.empty());
 }
 
 TEST(Color, HasMagmaEndpointsAndClamps) {

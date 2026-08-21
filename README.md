@@ -81,6 +81,6 @@ The playback rate comes from `playback.fps` in the YAML configuration and can be
 
 ## Output
 
-Each successful frame produces a binary-compressed labeled PCD and JSON metadata. `resolved_config.yaml` and `run_summary.json` describe the run. Exit status is 0 on full success, 2 when bad frames were skipped, and 1 for startup/global failures or fail-fast termination.
+Each successful frame produces a binary-compressed labeled PCD and schema-v3 JSON metadata. Filtered cluster point counts, AABBs, and touched boundary faces are included for diagnosis. `filtered_cluster_raw` is a diagnostic subset of `unclustered_raw`, not a separate semantic class. `resolved_config.yaml` and `run_summary.json` describe the run. Exit status is 0 on full success, 2 when bad frames were skipped, and 1 for startup/global failures or fail-fast termination.
 
 Obstacle colors are controlled by `color.palette`, `color.min_distance`, and `color.max_distance`. The default `red_green` palette maps the minimum distance to red and the maximum distance to green, with a yellow midpoint. The `magma` palette provides a dark-to-bright alternative; distances outside the configured range are clamped.

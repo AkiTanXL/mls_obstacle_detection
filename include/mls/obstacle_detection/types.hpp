@@ -50,7 +50,7 @@ struct Box3f {
   std::array<float, 3> max{};
 };
 
-struct RoiConfig { Box3f box{{-10.F, -8.F, -3.F}, {50.F, 8.F, 3.F}}; };
+struct RoiConfig { Box3f box{{-15.F, -15.F, -3.F}, {70.F, 15.F, 4.F}}; };
 struct EgoBoxConfig { Box3f box{{-1.5F, -1.7F, -1.F}, {2.6F, 1.7F, -0.4F}}; };
 struct VoxelConfig { float leaf_size{0.2F}; std::uint32_t min_points_per_voxel{1}; };
 struct GroundConfig {
@@ -62,6 +62,10 @@ struct GroundConfig {
   double min_inlier_ratio{0.15};
 };
 struct ClusterConfig { float tolerance{0.5F}; int min_points{10}; int max_points{1000}; };
+struct ClusterFilterConfig {
+  bool enabled{true};
+  float roi_boundary_margin{0.5F};
+};
 struct ColorConfig {
   float min_distance{0.F};
   float max_distance{50.F};
@@ -80,6 +84,7 @@ struct PipelineConfig {
   VoxelConfig voxel;
   GroundConfig ground;
   ClusterConfig cluster;
+  ClusterFilterConfig cluster_filter;
   ColorConfig color;
   SaveConfig save;
   PlaybackConfig playback;
@@ -95,6 +100,12 @@ struct Obstacle {
   std::size_t min_original_index{0};
 };
 
+struct FilteredCluster {
+  std::size_t point_count{0};
+  Box3f aabb;
+  std::vector<std::string> boundary_faces;
+};
+
 struct PointCounts {
   std::size_t input{0};
   std::size_t valid{0};
@@ -102,6 +113,7 @@ struct PointCounts {
   std::size_t voxel{0};
   std::size_t ground_voxel{0};
   std::size_t non_ground_voxel{0};
+  std::size_t filtered_cluster_points{0};
   std::size_t obstacle_points{0};
 };
 
@@ -122,6 +134,7 @@ struct DetectionResult {
   pcl::PointCloud<LabeledPoint>::Ptr labeled_cloud{new pcl::PointCloud<LabeledPoint>};
   std::array<float, 4> ground_coefficients{};
   std::vector<Obstacle> obstacles;
+  std::vector<FilteredCluster> filtered_clusters;
   PointCounts counts;
   StageTimings timings;
 };

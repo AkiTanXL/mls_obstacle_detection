@@ -9,13 +9,16 @@
 #include <pcl/segmentation/sac_segmentation.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace mls::obstacle_detection {
 namespace {
@@ -31,6 +34,22 @@ bool inside(const pcl::PointXYZI& point, const Box3f& box) {
          point.y >= box.min[1] && point.y <= box.max[1] &&
          point.z >= box.min[2] && point.z <= box.max[2];
 }
+
+std::vector<std::string> horizontalBoundaryFaces(const Box3f& aabb, const Box3f& roi,
+                                                 float margin) {
+  std::vector<std::string> faces;
+  if (aabb.min[0] - roi.min[0] <= margin) faces.emplace_back("x_min");
+  if (roi.max[0] - aabb.max[0] <= margin) faces.emplace_back("x_max");
+  if (aabb.min[1] - roi.min[1] <= margin) faces.emplace_back("y_min");
+  if (roi.max[1] - aabb.max[1] <= margin) faces.emplace_back("y_max");
+  return faces;
+}
+
+struct ClusterCandidate {
+  std::size_t raw_cluster_index{0};
+  Obstacle obstacle;
+  std::vector<std::string> boundary_faces;
+};
 
 std::array<std::uint8_t, 3> interpolate(const std::array<std::uint8_t, 3>& a,
                                         const std::array<std::uint8_t, 3>& b, float t) {
@@ -208,12 +227,14 @@ DetectionResult ObstacleDetectionPipeline::process(const Frame& frame) const {
     if (cluster >= 0) raw_cluster_indices.at(static_cast<std::size_t>(cluster)).push_back(original_index);
   }
 
-  std::vector<Obstacle> provisional;
-  provisional.reserve(raw_cluster_indices.size());
+  std::vector<ClusterCandidate> candidates;
+  candidates.reserve(raw_cluster_indices.size());
   for (std::size_t cluster = 0; cluster < raw_cluster_indices.size(); ++cluster) {
     const auto& indices = raw_cluster_indices[cluster];
     if (indices.empty()) continue;
-    Obstacle obstacle;
+    ClusterCandidate candidate;
+    candidate.raw_cluster_index = cluster;
+    auto& obstacle = candidate.obstacle;
     obstacle.point_count = indices.size();
     obstacle.min_original_index = *std::min_element(indices.begin(), indices.end());
     obstacle.aabb.min.fill(std::numeric_limits<float>::infinity());
@@ -236,30 +257,43 @@ DetectionResult ObstacleDetectionPipeline::process(const Frame& frame) const {
     const float dz = 0.5F * (obstacle.aabb.min[2] + obstacle.aabb.max[2]) - frame.sensor_origin[2];
     obstacle.sensor_distance = std::sqrt(dx * dx + dy * dy + dz * dz);
     obstacle.color = distanceColor(obstacle.sensor_distance, config_.color);
-    provisional.push_back(obstacle);
-  }
-  std::stable_sort(provisional.begin(), provisional.end(), [](const Obstacle& a, const Obstacle& b) {
-    return std::tie(a.sensor_distance, a.centroid[0], a.centroid[1], a.centroid[2], a.min_original_index) <
-           std::tie(b.sensor_distance, b.centroid[0], b.centroid[1], b.centroid[2], b.min_original_index);
-  });
-  for (std::size_t sorted = 0; sorted < provisional.size(); ++sorted) {
-    auto& obstacle = provisional[sorted];
-    obstacle.instance_id = static_cast<std::uint32_t>(sorted + 1);
-    for (std::size_t cluster = 0; cluster < raw_cluster_indices.size(); ++cluster) {
-      if (raw_cluster_indices[cluster].empty()) continue;
-      if (*std::min_element(raw_cluster_indices[cluster].begin(), raw_cluster_indices[cluster].end()) !=
-          obstacle.min_original_index) continue;
-      for (const std::size_t index : raw_cluster_indices[cluster]) {
-        auto& output = result.labeled_cloud->points[index];
-        output.semantic_label = static_cast<std::uint32_t>(SemanticLabel::obstacle);
-        output.instance_id = obstacle.instance_id;
-        output.rgba = packRgba(obstacle.color);
-      }
-      result.counts.obstacle_points += raw_cluster_indices[cluster].size();
-      break;
+    if (config_.cluster_filter.enabled) {
+      candidate.boundary_faces = horizontalBoundaryFaces(
+          obstacle.aabb, config_.roi.box, config_.cluster_filter.roi_boundary_margin);
     }
+    candidates.push_back(std::move(candidate));
   }
-  result.obstacles = std::move(provisional);
+  std::stable_sort(candidates.begin(), candidates.end(), [](const ClusterCandidate& a,
+                                                             const ClusterCandidate& b) {
+    return std::tie(a.obstacle.sensor_distance, a.obstacle.centroid[0], a.obstacle.centroid[1],
+                    a.obstacle.centroid[2], a.obstacle.min_original_index) <
+           std::tie(b.obstacle.sensor_distance, b.obstacle.centroid[0], b.obstacle.centroid[1],
+                    b.obstacle.centroid[2], b.obstacle.min_original_index);
+  });
+  for (auto& candidate : candidates) {
+    const auto& indices = raw_cluster_indices[candidate.raw_cluster_index];
+    const bool filtered = config_.cluster_filter.enabled && !candidate.boundary_faces.empty();
+    if (filtered) {
+      FilteredCluster diagnostic;
+      diagnostic.point_count = candidate.obstacle.point_count;
+      diagnostic.aabb = candidate.obstacle.aabb;
+      diagnostic.boundary_faces = std::move(candidate.boundary_faces);
+      result.filtered_clusters.push_back(std::move(diagnostic));
+      result.counts.filtered_cluster_points += indices.size();
+      continue;
+    }
+
+    auto& obstacle = candidate.obstacle;
+    obstacle.instance_id = static_cast<std::uint32_t>(result.obstacles.size() + 1);
+    for (const std::size_t index : indices) {
+      auto& output = result.labeled_cloud->points[index];
+      output.semantic_label = static_cast<std::uint32_t>(SemanticLabel::obstacle);
+      output.instance_id = obstacle.instance_id;
+      output.rgba = packRgba(obstacle.color);
+    }
+    result.counts.obstacle_points += indices.size();
+    result.obstacles.push_back(std::move(obstacle));
+  }
   const auto label_end = Clock::now();
   result.timings.label_ms = elapsedMs(label_begin, label_end);
   result.timings.algorithm_ms = elapsedMs(algorithm_begin, label_end);

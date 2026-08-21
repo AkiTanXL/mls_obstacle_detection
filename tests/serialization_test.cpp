@@ -7,6 +7,8 @@
 #include <pcl/io/pcd_io.h>
 
 #include <fstream>
+#include <string>
+#include <utility>
 
 namespace od = mls::obstacle_detection;
 
@@ -39,8 +41,14 @@ TEST(Serialization, WritesExpectedFieldsOrderViewpointAndJsonSchema) {
   obstacle.sensor_distance = 5.F;
   obstacle.color = {{10, 20, 30}};
   result.obstacles.push_back(obstacle);
+  od::FilteredCluster filtered;
+  filtered.point_count = 12;
+  filtered.aabb = {{-2.F, 7.8F, 0.F}, {9.F, 8.F, 3.F}};
+  filtered.boundary_faces = {"y_max"};
+  result.filtered_clusters.push_back(filtered);
+  result.counts.filtered_cluster_points = 12;
   const auto paths = od::outputPathsFor(temporary.path(), frame);
-  od::writeFrameResultAtomic(paths, frame, result, true);
+  od::writeFrameResultAtomic(paths, result, true);
   pcl::PCLPointCloud2 blob;
   Eigen::Vector4f origin;
   Eigen::Quaternionf orientation;
@@ -62,14 +70,22 @@ TEST(Serialization, WritesExpectedFieldsOrderViewpointAndJsonSchema) {
   EXPECT_EQ(loaded.points[1].instance_id, 1U);
   std::ifstream input(paths.json);
   const auto json = nlohmann::json::parse(input);
-  EXPECT_EQ(json.at("schema_version"), 1);
+  EXPECT_EQ(json.at("schema_version"), 3);
   EXPECT_EQ(json.at("point_counts").at("input"), 2);
+  EXPECT_EQ(json.at("point_counts").at("filtered_cluster_raw"), 12);
   EXPECT_EQ(json.at("obstacle_count"), 1);
   EXPECT_EQ(json.at("obstacles").at(0).at("point_count"), 1);
   const auto& saved_box = json.at("obstacles").at(0).at("aabb");
   EXPECT_LE(saved_box.at("min").at(0).get<float>(), loaded.points[1].x);
   EXPECT_GE(saved_box.at("max").at(0).get<float>(), loaded.points[1].x);
   EXPECT_TRUE(json.contains("timings_ms"));
+  EXPECT_EQ(json.at("filtered_cluster_count"), 1);
+  const auto& filtered_json = json.at("filtered_clusters").at(0);
+  EXPECT_EQ(filtered_json.at("point_count"), 12);
+  EXPECT_EQ(filtered_json.at("boundary_faces").at(0), "y_max");
+  EXPECT_EQ(filtered_json.size(), 3U);
+  EXPECT_FALSE(filtered_json.contains("horizontal_extents"));
+  EXPECT_FALSE(filtered_json.contains("reasons"));
 }
 
 TEST(Serialization, AtomicWriteFailureDoesNotLeaveTargets) {
@@ -80,7 +96,7 @@ TEST(Serialization, AtomicWriteFailureDoesNotLeaveTargets) {
   result.frame_id = frame.id;
   const auto missing = temporary.path() / "does-not-exist";
   const auto paths = od::outputPathsFor(missing, frame);
-  EXPECT_THROW(od::writeFrameResultAtomic(paths, frame, result, true), std::runtime_error);
+  EXPECT_THROW(od::writeFrameResultAtomic(paths, result, true), std::runtime_error);
   EXPECT_FALSE(std::filesystem::exists(paths.pcd));
   EXPECT_FALSE(std::filesystem::exists(paths.json));
 }
@@ -90,4 +106,54 @@ TEST(Serialization, RejectsNonEmptyOutputUnlessOverwrite) {
   { std::ofstream output(temporary.path() / "existing"); output << "x"; }
   EXPECT_THROW(od::prepareOutputDirectory(temporary.path(), false), std::runtime_error);
   EXPECT_NO_THROW(od::prepareOutputDirectory(temporary.path(), true));
+}
+
+TEST(Serialization, AsyncWriterDrainsFramesInSubmissionOrder) {
+  TemporaryDirectory temporary;
+  od::AsyncFrameWriter writer(true, 2);
+  for (int index = 0; index < 3; ++index) {
+    od::DetectionResult result;
+    result.frame_id = "async_" + std::to_string(index);
+    result.source_path = std::filesystem::path("input") / (result.frame_id + ".pcd");
+    result.counts.input = 1;
+    result.timings.algorithm_ms = static_cast<double>(index + 1);
+    result.labeled_cloud->width = 1;
+    result.labeled_cloud->height = 1;
+    result.labeled_cloud->resize(1);
+    result.labeled_cloud->points[0].x = static_cast<float>(index);
+    const od::OutputPaths paths{temporary.path() / (result.frame_id + ".pcd"),
+                                temporary.path() / (result.frame_id + ".json")};
+    writer.enqueue(paths, std::move(result));
+  }
+  writer.finish();
+
+  const auto completions = writer.takeCompletions();
+  ASSERT_EQ(completions.size(), 3U);
+  for (std::size_t index = 0; index < completions.size(); ++index) {
+    const std::string id = "async_" + std::to_string(index);
+    EXPECT_EQ(completions[index].source_path.filename(), id + ".pcd");
+    EXPECT_DOUBLE_EQ(completions[index].algorithm_ms, static_cast<double>(index + 1));
+    EXPECT_GE(completions[index].save_ms, 0.0);
+    EXPECT_TRUE(std::filesystem::exists(temporary.path() / (id + ".pcd")));
+    EXPECT_TRUE(std::filesystem::exists(temporary.path() / (id + ".json")));
+  }
+  EXPECT_TRUE(writer.takeCompletions().empty());
+}
+
+TEST(Serialization, AsyncWriterPropagatesSaveFailure) {
+  TemporaryDirectory temporary;
+  od::AsyncFrameWriter writer(true);
+  od::DetectionResult result;
+  result.frame_id = "failure";
+  result.source_path = "input/failure.pcd";
+  const auto missing = temporary.path() / "missing";
+  writer.enqueue({missing / "failure.pcd", missing / "failure.json"}, std::move(result));
+  EXPECT_THROW(writer.finish(), std::runtime_error);
+  EXPECT_THROW(writer.rethrowIfFailed(), std::runtime_error);
+  EXPECT_FALSE(std::filesystem::exists(missing / "failure.pcd"));
+  EXPECT_FALSE(std::filesystem::exists(missing / "failure.json"));
+}
+
+TEST(Serialization, AsyncWriterRejectsZeroCapacity) {
+  EXPECT_THROW(od::AsyncFrameWriter(true, 0), std::invalid_argument);
 }

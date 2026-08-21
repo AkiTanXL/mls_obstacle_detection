@@ -4,9 +4,15 @@
 #include <pcl/io/pcd_io.h>
 
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <exception>
 #include <fstream>
+#include <mutex>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
+#include <utility>
 
 namespace mls::obstacle_detection {
 namespace {
@@ -28,6 +34,134 @@ nlohmann::json boxJson(const Box3f& box) {
 
 }  // namespace
 
+struct AsyncFrameWriter::Impl {
+  struct SaveJob {
+    OutputPaths paths;
+    DetectionResult result;
+  };
+
+  explicit Impl(bool binary_compressed_value, std::size_t capacity_value)
+      : binary_compressed(binary_compressed_value), capacity(capacity_value) {
+    if (capacity == 0) throw std::invalid_argument("async writer capacity must be positive");
+    worker = std::thread([this] { run(); });
+  }
+
+  ~Impl() { closeAndJoin(); }
+
+  void enqueue(OutputPaths paths, DetectionResult result) {
+    std::unique_lock<std::mutex> lock(mutex);
+    space_available.wait(lock, [this] {
+      return pending < capacity || error != nullptr || closing;
+    });
+    if (error) {
+      const auto saved_error = error;
+      lock.unlock();
+      std::rethrow_exception(saved_error);
+    }
+    if (closing) throw std::logic_error("cannot enqueue after async writer is closed");
+    jobs.push_back({std::move(paths), std::move(result)});
+    ++pending;
+    lock.unlock();
+    work_ready.notify_one();
+  }
+
+  std::vector<FrameSaveCompletion> takeCompletions() {
+    std::lock_guard<std::mutex> lock(mutex);
+    std::vector<FrameSaveCompletion> completed;
+    completed.swap(completions);
+    return completed;
+  }
+
+  void rethrowIfFailed() const {
+    std::exception_ptr saved_error;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      saved_error = error;
+    }
+    if (saved_error) std::rethrow_exception(saved_error);
+  }
+
+  void finish() {
+    closeAndJoin();
+    rethrowIfFailed();
+  }
+
+  void closeAndJoin() noexcept {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      closing = true;
+    }
+    work_ready.notify_all();
+    space_available.notify_all();
+    if (worker.joinable()) worker.join();
+  }
+
+  void run() noexcept {
+    while (true) {
+      SaveJob job;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        work_ready.wait(lock, [this] { return closing || !jobs.empty(); });
+        if (jobs.empty()) return;
+        job = std::move(jobs.front());
+        jobs.pop_front();
+      }
+      try {
+        writeFrameResultAtomic(job.paths, job.result, binary_compressed);
+        FrameSaveCompletion completion{
+            job.result.source_path, job.result.counts, job.result.obstacles.size(),
+            job.result.filtered_clusters.size(), job.result.timings.algorithm_ms,
+            job.result.timings.save_ms};
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          completions.push_back(std::move(completion));
+          --pending;
+        }
+        space_available.notify_all();
+      } catch (...) {
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          error = std::current_exception();
+          jobs.clear();
+          pending = 0;
+          closing = true;
+        }
+        space_available.notify_all();
+        return;
+      }
+    }
+  }
+
+  bool binary_compressed{true};
+  std::size_t capacity{2};
+  mutable std::mutex mutex;
+  std::condition_variable work_ready;
+  std::condition_variable space_available;
+  std::deque<SaveJob> jobs;
+  std::vector<FrameSaveCompletion> completions;
+  std::size_t pending{0};
+  bool closing{false};
+  std::exception_ptr error;
+  std::thread worker;
+};
+
+AsyncFrameWriter::AsyncFrameWriter(bool binary_compressed, std::size_t capacity)
+    : impl_(std::make_unique<Impl>(binary_compressed, capacity)) {}
+
+AsyncFrameWriter::~AsyncFrameWriter() = default;
+
+void AsyncFrameWriter::enqueue(OutputPaths paths, DetectionResult result) {
+  impl_->enqueue(std::move(paths), std::move(result));
+}
+
+std::vector<FrameSaveCompletion> AsyncFrameWriter::takeCompletions() {
+  return impl_->takeCompletions();
+}
+
+void AsyncFrameWriter::rethrowIfFailed() const { impl_->rethrowIfFailed(); }
+
+void AsyncFrameWriter::finish() { impl_->finish(); }
+
 void prepareOutputDirectory(const std::filesystem::path& output, bool overwrite) {
   std::error_code error;
   if (std::filesystem::exists(output, error)) {
@@ -46,7 +180,7 @@ OutputPaths outputPathsFor(const std::filesystem::path& output, const Frame& fra
   return {output / (frame.id + ".pcd"), output / (frame.id + ".json")};
 }
 
-std::string resultToJson(const Frame& frame, const DetectionResult& result) {
+std::string resultToJson(const DetectionResult& result) {
   nlohmann::json obstacles = nlohmann::json::array();
   for (const auto& obstacle : result.obstacles) {
     obstacles.push_back({
@@ -58,6 +192,14 @@ std::string resultToJson(const Frame& frame, const DetectionResult& result) {
         {"color_rgb", obstacle.color},
     });
   }
+  nlohmann::json filtered_clusters = nlohmann::json::array();
+  for (const auto& cluster : result.filtered_clusters) {
+    filtered_clusters.push_back({
+        {"point_count", cluster.point_count},
+        {"aabb", boxJson(cluster.aabb)},
+        {"boundary_faces", cluster.boundary_faces},
+    });
+  }
   const double crop_ratio = result.counts.valid == 0 ? 0.0 :
       static_cast<double>(result.counts.roi) / static_cast<double>(result.counts.valid);
   const double ground_ratio = result.counts.voxel == 0 ? 0.0 :
@@ -67,14 +209,15 @@ std::string resultToJson(const Frame& frame, const DetectionResult& result) {
     if (point.semantic_label < raw_labels.size()) ++raw_labels[point.semantic_label];
   }
   nlohmann::json json{
-      {"schema_version", 1},
+      {"schema_version", 3},
       {"frame_id", result.frame_id},
-      {"source", frame.source_path.string()},
+      {"source", result.source_path.string()},
       {"point_counts", {
           {"input", result.counts.input}, {"valid", result.counts.valid},
           {"roi", result.counts.roi}, {"voxel", result.counts.voxel},
           {"ground_voxel", result.counts.ground_voxel},
           {"non_ground_voxel", result.counts.non_ground_voxel},
+          {"filtered_cluster_raw", result.counts.filtered_cluster_points},
           {"ignored_raw", raw_labels[0]}, {"ground_raw", raw_labels[1]},
           {"unclustered_raw", raw_labels[2]}, {"obstacle_raw", raw_labels[3]}}},
       {"ratios", {{"crop_retained", crop_ratio}, {"ground_voxel", ground_ratio}}},
@@ -86,6 +229,8 @@ std::string resultToJson(const Frame& frame, const DetectionResult& result) {
           {"algorithm", result.timings.algorithm_ms}, {"save", result.timings.save_ms}}},
       {"obstacle_count", result.obstacles.size()},
       {"obstacles", std::move(obstacles)},
+      {"filtered_cluster_count", result.filtered_clusters.size()},
+      {"filtered_clusters", std::move(filtered_clusters)},
   };
   return json.dump(2) + "\n";
 }
@@ -107,8 +252,8 @@ void writeTextAtomic(const std::filesystem::path& path, const std::string& text)
   }
 }
 
-void writeFrameResultAtomic(const OutputPaths& paths, const Frame& frame,
-                            DetectionResult& result, bool binary_compressed) {
+void writeFrameResultAtomic(const OutputPaths& paths, DetectionResult& result,
+                            bool binary_compressed) {
   const auto save_begin = std::chrono::steady_clock::now();
   const auto pcd_temporary = temporaryPath(paths.pcd);
   const auto json_temporary = temporaryPath(paths.json);
@@ -122,7 +267,7 @@ void writeFrameResultAtomic(const OutputPaths& paths, const Frame& frame,
     {
       std::ofstream output(json_temporary, std::ios::binary | std::ios::trunc);
       if (!output) throw std::runtime_error("cannot open JSON temporary file: " + json_temporary.string());
-      output << resultToJson(frame, result);
+      output << resultToJson(result);
       output.flush();
       if (!output) throw std::runtime_error("failed writing JSON temporary file: " + json_temporary.string());
     }

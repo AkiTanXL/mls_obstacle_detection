@@ -17,7 +17,7 @@
 #include <optional>
 #include <set>
 #include <string>
-#include <thread>
+#include <utility>
 #include <vector>
 
 namespace od = mls::obstacle_detection;
@@ -32,6 +32,8 @@ struct RunState {
   nlohmann::json errors = nlohmann::json::array();
   std::set<std::string> saved_frames;
 };
+
+enum class ProcessStatus { end, skipped, success };
 
 double percentile95(std::vector<double> values) {
   if (values.empty()) return 0.0;
@@ -51,47 +53,59 @@ std::string summaryJson(const RunState& state, std::size_t total) {
   return summary.dump(2) + "\n";
 }
 
-bool handleFrame(od::FrameSource& source, const od::ObstacleDetectionPipeline& pipeline,
-                 const od::PipelineConfig& config, const std::filesystem::path& output,
-                 bool fail_fast, RunState& state, od::DetectionResult& displayed) {
-  od::Frame frame;
+od::FrameSaveCompletion frameSaveCompletion(const od::DetectionResult& result) {
+  return {result.source_path, result.counts, result.obstacles.size(),
+          result.filtered_clusters.size(), result.timings.algorithm_ms, result.timings.save_ms};
+}
+
+void recordSavedFrame(const od::FrameSaveCompletion& completion, RunState& state) {
+  ++state.succeeded;
+  state.algorithm_times.push_back(completion.algorithm_ms);
+  const double retained = completion.counts.valid == 0 ? 0.0 :
+      100.0 * completion.counts.roi / completion.counts.valid;
+  const double ground = completion.counts.voxel == 0 ? 0.0 :
+      100.0 * completion.counts.ground_voxel / completion.counts.voxel;
+  std::cout << "[ok] " << completion.source_path.filename() << " points="
+            << completion.counts.input << " crop=" << retained << "% ground=" << ground
+            << "% obstacles=" << completion.obstacle_count << " filtered="
+            << completion.filtered_cluster_count << " algorithm=" << completion.algorithm_ms
+            << "ms save=" << completion.save_ms << "ms\n";
+}
+
+ProcessStatus processNextFrame(od::FrameSource& source,
+                               const od::ObstacleDetectionPipeline& pipeline,
+                               bool fail_fast, RunState& state, od::Frame& frame,
+                               od::DetectionResult& result) {
+  frame = od::Frame{};
+  result = od::DetectionResult{};
   const auto read_begin = Clock::now();
   try {
-    if (!source.next(frame)) return false;
+    if (!source.next(frame)) return ProcessStatus::end;
   } catch (const std::exception& error) {
     ++state.skipped;
     state.errors.push_back({{"stage", "read"}, {"reason", error.what()}});
     std::cerr << "[skip] " << error.what() << '\n';
     if (fail_fast) throw;
-    return true;
+    return ProcessStatus::skipped;
   }
   const double read_ms = std::chrono::duration<double, std::milli>(Clock::now() - read_begin).count();
   try {
-    displayed = pipeline.process(frame);
-    displayed.timings.read_ms = read_ms;
+    result = pipeline.process(frame);
+    result.timings.read_ms = read_ms;
   } catch (const std::exception& error) {
     ++state.skipped;
     state.errors.push_back({{"source", frame.source_path.string()}, {"stage", "algorithm"}, {"reason", error.what()}});
     std::cerr << "[skip] " << frame.source_path << ": " << error.what() << '\n';
     if (fail_fast) throw;
-    return true;
+    return ProcessStatus::skipped;
   }
+  return ProcessStatus::success;
+}
 
-  if (state.saved_frames.insert(frame.id).second) {
-    od::writeFrameResultAtomic(od::outputPathsFor(output, frame), frame, displayed,
-                               config.save.binary_compressed);
-    ++state.succeeded;
-    state.algorithm_times.push_back(displayed.timings.algorithm_ms);
-    const double retained = displayed.counts.valid == 0 ? 0.0 :
-        100.0 * displayed.counts.roi / displayed.counts.valid;
-    const double ground = displayed.counts.voxel == 0 ? 0.0 :
-        100.0 * displayed.counts.ground_voxel / displayed.counts.voxel;
-    std::cout << "[ok] " << frame.source_path.filename() << " points=" << displayed.counts.input
-              << " crop=" << retained << "% ground=" << ground << "% obstacles="
-              << displayed.obstacles.size() << " algorithm=" << displayed.timings.algorithm_ms
-              << "ms save=" << displayed.timings.save_ms << "ms\n";
+void collectCompletions(od::AsyncFrameWriter& writer, RunState& state) {
+  for (const auto& completion : writer.takeCompletions()) {
+    recordSavedFrame(completion, state);
   }
-  return true;
 }
 
 }  // namespace
@@ -137,15 +151,28 @@ int main(int argc, char** argv) {
     RunState state;
     const bool use_viewer = !no_viewer;
     if (!use_viewer) {
-      od::DetectionResult unused;
-      while (handleFrame(*source, pipeline, config, output_path, fail_fast, state, unused)) {}
+      od::Frame frame;
+      od::DetectionResult result;
+      while (true) {
+        const auto status = processNextFrame(*source, pipeline, fail_fast, state, frame, result);
+        if (status == ProcessStatus::end) break;
+        if (status == ProcessStatus::skipped) continue;
+        if (!state.saved_frames.insert(frame.id).second) continue;
+        od::writeFrameResultAtomic(od::outputPathsFor(output_path, frame), result,
+                                   config.save.binary_compressed);
+        recordSavedFrame(frameSaveCompletion(result), state);
+      }
     } else {
       auto viewer = std::make_unique<od::DetectionViewer>();
+      od::AsyncFrameWriter writer(config.save.binary_compressed);
       bool paused = false;
       bool advance = true;
       auto deadline = Clock::now();
+      od::Frame frame;
       od::DetectionResult displayed;
       while (!viewer->stopped()) {
+        writer.rethrowIfFailed();
+        collectCompletions(writer, state);
         const auto command = viewer->spinOnce(10);
         if (command == od::ViewerCommand::quit) break;
         if (command == od::ViewerCommand::toggle_pause) paused = !paused;
@@ -158,18 +185,26 @@ int main(int argc, char** argv) {
         if (command == od::ViewerCommand::reset_view) viewer->resetCamera();
         if (!paused && Clock::now() >= deadline) advance = true;
         if (!advance) continue;
-        if (!handleFrame(*source, pipeline, config, output_path, fail_fast, state, displayed)) {
+        const auto status = processNextFrame(*source, pipeline, fail_fast, state, frame, displayed);
+        if (status == ProcessStatus::end) {
           if (config.playback.loop) {
             source->reset();
             continue;
           }
           break;
         }
-        if (!displayed.frame_id.empty()) viewer->show(displayed);
+        if (status == ProcessStatus::success) {
+          viewer->show(displayed);
+          if (state.saved_frames.insert(frame.id).second) {
+            writer.enqueue(od::outputPathsFor(output_path, frame), std::move(displayed));
+          }
+        }
         advance = false;
         deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(
             std::chrono::duration<double>(1.0 / config.playback.fps));
       }
+      writer.finish();
+      collectCompletions(writer, state);
     }
     od::writeTextAtomic(output_path / "run_summary.json", summaryJson(state, source->size()));
     return state.skipped == 0 ? 0 : 2;

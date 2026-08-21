@@ -2,6 +2,8 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <sstream>
 #include <stdexcept>
@@ -82,6 +84,20 @@ PipelineConfig loadConfig(const std::filesystem::path& path) {
     assignIfPresent(node, "min_points", config.cluster.min_points);
     assignIfPresent(node, "max_points", config.cluster.max_points);
   }
+  if (const auto node = root["cluster_filter"]) {
+    static constexpr std::array<const char*, 5> removed_keys{{
+        "max_horizontal_major_extent", "max_horizontal_minor_extent", "max_height",
+        "max_horizontal_aspect_ratio", "min_major_extent_for_aspect_ratio"}};
+    for (const char* key : removed_keys) {
+      if (node[key]) {
+        throw std::invalid_argument(
+            std::string("cluster_filter.") + key +
+            " is no longer supported; boundary filtering now uses only enabled and roi_boundary_margin");
+      }
+    }
+    assignIfPresent(node, "enabled", config.cluster_filter.enabled);
+    assignIfPresent(node, "roi_boundary_margin", config.cluster_filter.roi_boundary_margin);
+  }
   if (const auto node = root["color"]) {
     assignIfPresent(node, "min_distance", config.color.min_distance);
     assignIfPresent(node, "max_distance", config.color.max_distance);
@@ -136,6 +152,18 @@ void validateConfig(const PipelineConfig& config) {
   if (config.cluster.min_points <= 0 || config.cluster.max_points < config.cluster.min_points) {
     throw std::invalid_argument("cluster point range must be positive and ordered");
   }
+  const auto& filter = config.cluster_filter;
+  checkFinite(filter.roi_boundary_margin, "cluster_filter.roi_boundary_margin");
+  const float minimum_horizontal_span = std::min(
+      config.roi.box.max[0] - config.roi.box.min[0],
+      config.roi.box.max[1] - config.roi.box.min[1]);
+  if (filter.roi_boundary_margin <= 0.F) {
+    throw std::invalid_argument("cluster_filter.roi_boundary_margin must be positive");
+  }
+  if (filter.enabled && 2.F * filter.roi_boundary_margin >= minimum_horizontal_span) {
+    throw std::invalid_argument(
+        "cluster_filter.roi_boundary_margin must be less than half the minimum horizontal ROI span when enabled");
+  }
   checkFinite(config.color.min_distance, "color.min_distance");
   checkFinite(config.color.max_distance, "color.max_distance");
   if (config.color.min_distance < 0.F || config.color.min_distance >= config.color.max_distance) {
@@ -171,6 +199,10 @@ std::string configToYaml(const PipelineConfig& c) {
       << YAML::Key << "tolerance" << YAML::Value << c.cluster.tolerance
       << YAML::Key << "min_points" << YAML::Value << c.cluster.min_points
       << YAML::Key << "max_points" << YAML::Value << c.cluster.max_points << YAML::EndMap;
+  out << YAML::Key << "cluster_filter" << YAML::Value << YAML::BeginMap
+      << YAML::Key << "enabled" << YAML::Value << c.cluster_filter.enabled
+      << YAML::Key << "roi_boundary_margin" << YAML::Value
+      << c.cluster_filter.roi_boundary_margin << YAML::EndMap;
   out << YAML::Key << "color" << YAML::Value << YAML::BeginMap
       << YAML::Key << "palette" << YAML::Value << c.color.palette
       << YAML::Key << "min_distance" << YAML::Value << c.color.min_distance

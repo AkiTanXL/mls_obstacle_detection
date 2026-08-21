@@ -1,6 +1,6 @@
 roi:
-  min: [-10.0, -8.0, -3.0]
-  max: [50.0, 8.0, 3.0]
+  min: [-10.0, -10.0, -3.0]
+  max: [50.0, 10.0, 3.0]
 ego_box:
   min: [-1.5, -1.7, -1.0]
   max: [2.6, 1.7, -0.4]
@@ -20,6 +20,9 @@ cluster:
   tolerance: 0.35
   min_points: 10
   max_points: 1000
+cluster_filter:
+  enabled: true
+  roi_boundary_margin: 0.5
 color:
   palette: red_green
   min_distance: 0.0
